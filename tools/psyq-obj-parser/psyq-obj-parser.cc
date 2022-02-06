@@ -55,8 +55,11 @@ enum class PsyqOpcode : uint8_t {
     END_SLD = 60,
     FUNCTION = 74,
     FUNCTION_END = 76,
+    BLOCK_START = 78,
+    BLOCK_END = 80,
     SECTION_DEF = 82,
     SECTION_DEF2 = 84,
+    FUNCTION_START2 = 86,
 };
 
 enum class PsyqRelocType : uint8_t {
@@ -64,6 +67,9 @@ enum class PsyqRelocType : uint8_t {
     REL26 = 74,
     HI16 = 82,
     LO16 = 84,
+    REL26_BE = 92,
+    HI16_BE = 96,
+    LO16_BE = 98,
     GPREL16 = 100,
 };
 
@@ -205,7 +211,7 @@ struct PsyqLnkFile {
     uint16_t twoPartsRelocSymbol;
 
     void display();
-    bool writeElf(const std::string& prefix, const std::string& out, bool abiNone);
+    bool writeElf(const std::string& prefix, const std::string& out, bool abiNone, bool bigEndian);
     template <typename... Args>
     inline void setElfConversionError(const std::string& formatStr, Args&&... args) {
         elfConversionError = fmt::format(formatStr, args...);
@@ -306,6 +312,18 @@ std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::File* file, bool verbose) 
                         vprint("(GPREL16), ");
                         break;
                     }
+                    case (uint8_t)PsyqRelocType::HI16_BE: {
+                        vprint("(HI16 BE), ");
+                        break;
+                    }
+                    case (uint8_t)PsyqRelocType::LO16_BE: {
+                        vprint("(LO16 BE), ");
+                        break;
+                    }
+                    case (uint8_t)PsyqRelocType::REL26_BE: {
+                        vprint("(LO16 BE), ");
+                        break;
+                    }
                     default: {
                         fmt::print("Unknown relocation type {}\n", relocType);
                         return nullptr;
@@ -386,7 +404,7 @@ std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::File* file, bool verbose) 
             case (uint8_t)PsyqOpcode::PROGRAMTYPE: {
                 uint8_t type = file->read<uint8_t>();
                 vprint("Program type {}\n", type);
-                if (type != 7) {
+                if (type != 7 && type != 9) {
                     fmt::print("Unknown program type {}.\n", type);
                     return nullptr;
                 }
@@ -489,6 +507,20 @@ std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::File* file, bool verbose) 
                         section, offset, endLine);
                 break;
             }
+            case (uint8_t)PsyqOpcode::BLOCK_START: {
+                uint16_t section = file->read<uint16_t>();
+                uint32_t offset = file->read<uint32_t>();
+                uint32_t start = file->read<uint32_t>();
+                vprint("Block start at line {} in section {} with offset {:X}\n", start, section, offset);
+                break;
+            }
+            case (uint8_t)PsyqOpcode::BLOCK_END: {
+                uint16_t section = file->read<uint16_t>();
+                uint32_t offset = file->read<uint32_t>();
+                uint32_t end = file->read<uint32_t>();
+                vprint("Block end at line {} in section {} with offset {:X}\n", end, section, offset);
+                break;
+            }
             case (uint8_t)PsyqOpcode::SECTION_DEF: {
                 uint16_t section = file->read<uint16_t>();
                 uint32_t value = file->read<uint32_t>();
@@ -517,6 +549,22 @@ std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::File* file, bool verbose) 
                 std::string name = readPsyqString(file);
                 vprint("SECTION_DEF2: section {}, value {}, _class {}, type {}, size {}, dims {}, tag {}, name {}\n",
                         section, value, _class, type, size, dims, tag, name);
+                break;
+            }
+            case (uint8_t)PsyqOpcode::FUNCTION_START2: {
+                uint16_t section = file->read<uint16_t>();
+                uint32_t offset = file->read<uint32_t>();
+                uint16_t fileno = file->read<uint16_t>();
+                uint32_t startline = file->read<uint32_t>();
+                uint16_t frame_reg = file->read<uint16_t>();
+                uint32_t frame_size = file->read<uint32_t>();
+                uint16_t retaddr = file->read<uint16_t>();
+                uint32_t mask = file->read<uint32_t>();
+                uint32_t mask_offset = file->read<uint32_t>();
+                uint32_t unk1 = file->read<uint32_t>();
+                uint32_t unk2 = file->read<uint32_t>();
+                std::string funcname = readPsyqString(file);
+                vprint("Start function 2: {}\n", funcname);
                 break;
             }
             default: {
@@ -755,9 +803,9 @@ void PsyqLnkFile::Expression::display(PsyqLnkFile* lnk, bool top) {
 }
 
 /* The ELF writer code */
-bool PsyqLnkFile::writeElf(const std::string& prefix, const std::string& out, bool abiNone) {
+bool PsyqLnkFile::writeElf(const std::string& prefix, const std::string& out, bool abiNone, bool bigEndian) {
     ELFIO::elfio writer;
-    writer.create(ELFCLASS32, ELFDATA2LSB);
+    writer.create(ELFCLASS32, bigEndian ? ELFDATA2MSB : ELFDATA2LSB);
     writer.set_os_abi(abiNone ? ELFOSABI_NONE : ELFOSABI_LINUX);
     writer.set_type(ET_REL);
     writer.set_machine(EM_MIPS);
@@ -820,7 +868,7 @@ bool PsyqLnkFile::Symbol::generateElfSymbol(PsyqLnkFile* psyq, ELFIO::string_sec
     ELFIO::Elf_Half elfSectionIndex = 0;
     bool isText = false;
 
-    fmt::print("    :: Generating symbol {}\n", name);
+    fmt::print("    :: Generating symbol {} {} {}\n", name, getOffset(psyq), sectionIndex);
     if (symbolType != Type::IMPORTED) {
         auto section = psyq->sections.find(sectionIndex);
         if (section == psyq->sections.end()) {
@@ -918,6 +966,9 @@ bool PsyqLnkFile::Relocation::generateElf(ElfRelocationPass pass, const std::str
         {PsyqRelocType::HI16, elf_mips_reloc_type::R_MIPS_HI16},
         {PsyqRelocType::LO16, elf_mips_reloc_type::R_MIPS_LO16},
         {PsyqRelocType::GPREL16, elf_mips_reloc_type::R_MIPS_GPREL16},
+        {PsyqRelocType::REL26_BE, elf_mips_reloc_type::R_MIPS_26},
+        {PsyqRelocType::HI16_BE, elf_mips_reloc_type::R_MIPS_HI16},
+        {PsyqRelocType::LO16_BE, elf_mips_reloc_type::R_MIPS_LO16},
     };
     auto simpleSymbolReloc = [&, this](Expression* expr, ELFIO::Elf_Word elfSym = 0, uint16_t symbolOffset = 0) {
         if (psyq->twoPartsReloc) {
@@ -957,6 +1008,19 @@ bool PsyqLnkFile::Relocation::generateElf(ElfRelocationPass pass, const std::str
             case PsyqRelocType::GPREL16: {
                 sectionData[offset + 0] = 0;
                 sectionData[offset + 1] = 0;
+                break;
+            }
+            case PsyqRelocType::REL26_BE: {
+                sectionData[offset + 3] = 0;
+                sectionData[offset + 2] = 0;
+                sectionData[offset + 1] = 0;
+                sectionData[offset + 0] &= 0xfc;
+                break;
+            }
+            case PsyqRelocType::HI16_BE:
+            case PsyqRelocType::LO16_BE: {
+                sectionData[offset + 1] = 0;
+                sectionData[offset + 0] = 0;
                 break;
             }
             default:
@@ -1149,6 +1213,7 @@ Usage: {} input.obj [input2.obj...] [-h] [-v] [-d] [-n] [-p prefix] [-o output.o
   -p prefix      use this prefix for local symbols.
   -o output.o    tries to dump the parsed psyq LNK file into an ELF file;
                  can only work with a single input file.
+  -b             output a big-endian ELF file.
 )",
                    argv[0]);
         return -1;
@@ -1176,7 +1241,7 @@ Usage: {} input.obj [input2.obj...] [-h] [-v] [-d] [-n] [-p prefix] [-o output.o
                 if (hasOutput) {
                     fmt::print(":: Converting {} to {}...\n", input, output.value());
                     std::string prefix = args.get<std::string>("p").value_or("");
-                    bool success = psyq->writeElf(prefix, output.value(), args.get<bool>("n").value_or(false));
+                    bool success = psyq->writeElf(prefix, output.value(), args.get<bool>("n").value_or(false), args.get<bool>("b").value_or(false));
                     if (success) {
                         fmt::print(":: Conversion completed.\n");
                     } else {
