@@ -63,6 +63,7 @@ enum class PsyqOpcode : uint8_t {
 };
 
 enum class PsyqRelocType : uint8_t {
+    REL32_BE = 8,
     REL32 = 16,
     REL26 = 74,
     HI16 = 82,
@@ -173,6 +174,7 @@ struct PsyqLnkFile {
     struct Relocation {
         PsyqRelocType type;
         uint32_t offset;
+        int32_t addend;
         std::unique_ptr<Expression> expression;
         void display(PsyqLnkFile* lnk, PsyqLnkFile::Section* sec);
         bool generateElf(ElfRelocationPass pass, const std::string& prefix, PsyqLnkFile* psyq,
@@ -205,6 +207,7 @@ struct PsyqLnkFile {
 
     /* And there's some state we need to maintain during elf conversion */
     std::map<std::string, ELFIO::Elf_Word> localElfSymbols;
+    std::map<std::string, uint32_t> functionSizes;
     std::string elfConversionError;
     Relocation* twoPartsReloc = nullptr;
     uint32_t twoPartsRelocAddend;
@@ -239,6 +242,8 @@ std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::File* file, bool verbose) 
         fmt::print("Unknown version {}\n", version);
         return nullptr;
     }
+    uint32_t curFunctionStart = 0;
+    std::string curFunctionName = "";
 
     vprint(":: Parsing file...\n");
     while (!file->eof()) {
@@ -247,6 +252,24 @@ std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::File* file, bool verbose) 
         switch (opcode) {
             case (uint8_t)PsyqOpcode::END: {
                 vprint("EOF\n");
+                // Determine bss symbol placement
+                // This has to be done after parsing the whole psyq object, as bss may be out of order in the file.
+                // Doing it here ensures that we process symbols in their id order, instead of by psyq object file order.
+                for (auto& symbol : ret->symbols) {
+                    // Static bss symbols will be represented as a ZEROES opcode instead of UNINITIALIZED.
+                    // This will cause them to have a size of zero, so ignore size zero symbols here.
+                    // Their relocs will resolve to an offset of the local .bss instead, so this causes no issues.
+                    if (symbol.size > 0) {
+                        auto section = ret->sections.find(symbol.sectionIndex);
+                        if (section != ret->sections.end() && section->isBss()) {
+                            auto align = std::min((uint32_t)section->alignment, symbol.size) - 1;
+                            section->uninitializedOffset += align;
+                            section->uninitializedOffset &= ~align;
+                            symbol.offset = section->uninitializedOffset;
+                            section->uninitializedOffset += symbol.size;
+                        }
+                    }
+                }
                 return ret;
             }
             case (uint8_t)PsyqOpcode::BYTES: {
@@ -321,7 +344,11 @@ std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::File* file, bool verbose) 
                         break;
                     }
                     case (uint8_t)PsyqRelocType::REL26_BE: {
-                        vprint("(LO16 BE), ");
+                        vprint("(REL26 BE), ");
+                        break;
+                    }
+                    case (uint8_t)PsyqRelocType::REL32_BE: {
+                        vprint("(REL32 BE), ");
                         break;
                     }
                     default: {
@@ -338,7 +365,8 @@ std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::File* file, bool verbose) 
                 vprint("offset {:04x}+{:08x}, expression: \n", offset, section->pointer);
                 std::unique_ptr<Expression> expression = Expression::parse(file, verbose);
                 if (!expression) return nullptr;
-                section->relocations.emplace_back(Relocation{PsyqRelocType(relocType), offset + section->pointer, std::move(expression)});
+                // Addend will be populated later during expression evaluation
+                section->relocations.emplace_back(Relocation{PsyqRelocType(relocType), offset + section->pointer, 0, std::move(expression)});
                 break;
             }
             case (uint8_t)PsyqOpcode::EXPORTED_SYMBOL: {
@@ -431,23 +459,7 @@ std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::File* file, bool verbose) 
                     fmt::print("Section {} not found for {}.\n", sectionIndex, name);
                     return nullptr;
                 }
-
-                // Each entry is aligned to the size of the type after testing the output of mixed .bss and sbss with psyq GCC 2.7.2
-                // this works the same way as modern GCC.
-                auto sizeToUse = symbol->size;
-                if (sizeToUse > section->alignment) {
-                    sizeToUse = section->alignment;
-                }
-                auto align = sizeToUse - 1;
-                section->uninitializedOffset += align;
-                section->uninitializedOffset &= ~align;
-                symbol->offset = section->uninitializedOffset;
-
-                vprint("Uninitialized: id {}, section {}, offset {:08x}, size {:08x}, name {}\n", symbolIndex,
-                       sectionIndex, symbol->offset, size,
-                       name);
-
-                section->uninitializedOffset += size;
+                symbol->offset = 0; // Filled in later
                 ret->symbols.insert(symbolIndex, symbol);
                 break;
             }
@@ -495,14 +507,17 @@ std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::File* file, bool verbose) 
 				uint32_t mask = file->read<uint32_t>();
 				uint32_t maskOffset = file->read<uint32_t>();
                 std::string name = readPsyqString(file);
+                curFunctionStart = offset;
                 vprint("FUNCTION: section {}, offset {}, _file {}, startLine {}, frameReg {}, frameSize {}, retnPcReg {}, mask {}, maskOffset {}, name {}\n",
                         section, offset, _file, startLine, frameReg, frameSize, retnPcReg, mask, maskOffset, name);
+                curFunctionName = std::move(name);
                 break;
             }
             case (uint8_t)PsyqOpcode::FUNCTION_END: {
                 uint16_t section = file->read<uint16_t>();
 				uint32_t offset = file->read<uint32_t>();
 				uint32_t endLine = file->read<uint32_t>();
+                ret->functionSizes[curFunctionName] = offset - curFunctionStart;
                 vprint("FUNCTION_END: section {}, offset {}, endLine {}\n",
                         section, offset, endLine);
                 break;
@@ -554,17 +569,20 @@ std::unique_ptr<PsyqLnkFile> PsyqLnkFile::parse(PCSX::File* file, bool verbose) 
             case (uint8_t)PsyqOpcode::FUNCTION_START2: {
                 uint16_t section = file->read<uint16_t>();
                 uint32_t offset = file->read<uint32_t>();
-                uint16_t fileno = file->read<uint16_t>();
-                uint32_t startline = file->read<uint32_t>();
-                uint16_t frame_reg = file->read<uint16_t>();
-                uint32_t frame_size = file->read<uint32_t>();
-                uint16_t retaddr = file->read<uint16_t>();
+                uint16_t _file = file->read<uint16_t>();
+                uint32_t startLine = file->read<uint32_t>();
+                uint16_t frameReg = file->read<uint16_t>();
+                uint32_t frameSize = file->read<uint32_t>();
+                uint16_t retnPcReg = file->read<uint16_t>();
                 uint32_t mask = file->read<uint32_t>();
-                uint32_t mask_offset = file->read<uint32_t>();
+                uint32_t maskOffset = file->read<uint32_t>();
                 uint32_t unk1 = file->read<uint32_t>();
                 uint32_t unk2 = file->read<uint32_t>();
-                std::string funcname = readPsyqString(file);
-                vprint("Start function 2: {}\n", funcname);
+                std::string name = readPsyqString(file);
+                curFunctionStart = offset;
+                vprint("FUNCTION: section {}, offset {}, _file {}, startLine {}, frameReg {}, frameSize {}, retnPcReg {}, mask {}, maskOffset {}, name {}\n",
+                        section, offset, _file, startLine, frameReg, frameSize, retnPcReg, mask, maskOffset, name);
+                curFunctionName = std::move(name);
                 break;
             }
             default: {
@@ -732,6 +750,8 @@ void PsyqLnkFile::Relocation::display(PsyqLnkFile* lnk, PsyqLnkFile::Section* se
     static const std::map<PsyqRelocType, std::string> typeStr = {
         {PsyqRelocType::REL32, "REL32"}, {PsyqRelocType::REL26, "REL26"},     {PsyqRelocType::HI16, "HI16"},
         {PsyqRelocType::LO16, "LO16"},   {PsyqRelocType::GPREL16, "GPREL16"},
+        {PsyqRelocType::REL32_BE, "REL32 BE"}, {PsyqRelocType::REL26_BE, "REL26 BE"}, {PsyqRelocType::HI16_BE, "HI16 BE"},
+        {PsyqRelocType::LO16_BE, "LO16 BE"},
     };
     fmt::print("    {:8}   {:>12}::{:08x}  ", typeStr.find(type)->second, sec->name, offset);
     expression->display(lnk, true);
@@ -809,7 +829,12 @@ bool PsyqLnkFile::writeElf(const std::string& prefix, const std::string& out, bo
     writer.set_os_abi(abiNone ? ELFOSABI_NONE : ELFOSABI_LINUX);
     writer.set_type(ET_REL);
     writer.set_machine(EM_MIPS);
-    writer.set_flags(0x1000);  // ?!
+
+    if (false) {
+        writer.set_flags(0x1000);  // ?!
+    } else {
+        writer.set_flags(0x20001101);
+    }
 
     fmt::print("  :: Generating sections\n");
     for (auto& section : sections) {
@@ -836,12 +861,23 @@ bool PsyqLnkFile::writeElf(const std::string& prefix, const std::string& out, bo
         if (!success) return false;
     }
 
-    sym_sec->set_info(syma.get_symbols_num());
-
     fmt::print("  :: Generating symbols\n");
+    // Generate local symbols first
     for (auto& symbol : symbols) {
-        bool success = symbol.generateElfSymbol(this, stra, syma);
-        if (!success) return false;
+        if (symbol.symbolType == Symbol::Type::LOCAL) {
+            bool success = symbol.generateElfSymbol(this, stra, syma);
+            if (!success) return false;
+        }
+    }
+
+    sym_sec->set_info(syma.get_symbols_num());
+    
+    // Generate all other symbols afterwards
+    for (auto& symbol : symbols) {
+        if (symbol.symbolType != Symbol::Type::LOCAL) {
+            bool success = symbol.generateElfSymbol(this, stra, syma);
+            if (!success) return false;
+        }
     }
 
     fmt::print("  :: Generating relocations - pass 2, globals only\n");
@@ -879,7 +915,14 @@ bool PsyqLnkFile::Symbol::generateElfSymbol(PsyqLnkFile* psyq, ELFIO::string_sec
         elfSectionIndex = section->section->get_index();
         isText = section->isText();
     }
-    elfSym = syma.add_symbol(stra, name.c_str(), getOffset(psyq), size,
+    uint32_t functionSize = 0;
+    if (isText) {
+        auto functionSizeIter = psyq->functionSizes.find(name);
+        if (functionSizeIter != psyq->functionSizes.end()) {
+            functionSize = functionSizeIter->second;
+        }
+    }
+    elfSym = syma.add_symbol(stra, name.c_str(), getOffset(psyq), isText ? functionSize : size,
                              symbolType == Type::LOCAL ? STB_LOCAL : STB_GLOBAL,
                              isText ? STT_FUNC : STT_NOTYPE,
                              0, elfSectionIndex);
@@ -921,6 +964,18 @@ bool PsyqLnkFile::Section::generateElfSection(PsyqLnkFile* psyq, ELFIO::elfio& w
     return true;
 }
 
+static const std::map<PsyqRelocType, elf_mips_reloc_type> typeMap = {
+    {PsyqRelocType::REL32, elf_mips_reloc_type::R_MIPS_32},
+    {PsyqRelocType::REL26, elf_mips_reloc_type::R_MIPS_26},
+    {PsyqRelocType::HI16, elf_mips_reloc_type::R_MIPS_HI16},
+    {PsyqRelocType::LO16, elf_mips_reloc_type::R_MIPS_LO16},
+    {PsyqRelocType::GPREL16, elf_mips_reloc_type::R_MIPS_GPREL16},
+    {PsyqRelocType::REL26_BE, elf_mips_reloc_type::R_MIPS_26},
+    {PsyqRelocType::HI16_BE, elf_mips_reloc_type::R_MIPS_HI16},
+    {PsyqRelocType::LO16_BE, elf_mips_reloc_type::R_MIPS_LO16},
+    {PsyqRelocType::REL32_BE, elf_mips_reloc_type::R_MIPS_32},
+};
+
 bool PsyqLnkFile::Section::generateElfRelocations(ElfRelocationPass pass, const std::string& prefix, PsyqLnkFile* psyq,
                                                   ELFIO::elfio& writer, ELFIO::Elf_Word symbolSectionIndex,
                                                   ELFIO::string_section_accessor& stra,
@@ -944,6 +999,152 @@ bool PsyqLnkFile::Section::generateElfRelocations(ElfRelocationPass pass, const 
         psyq->setElfConversionError("Two parts relocation with only the first part");
         return false;
     }
+
+    // Pair any stray HI16 relocs with a previous matching one so that relocation addends are handled correctly
+    if (pass == ElfRelocationPass::PASS2) {
+        ELFIO::Elf_Xword num_relocs = rela.get_entries_num();
+        // Create a dummy type to represent a reloc, which is 8 bytes
+        using reloc_t = std::array<char, 8>;
+        // Get the pointer to the reloc table's data
+        const reloc_t* reloc_table = (const reloc_t*)rel_sec->get_data();
+        // Allocate a buffer to hold a copy of the reloc table when modifying it
+        std::vector<reloc_t> reloc_table_copy(num_relocs);
+        // Vector to hold the true addend of each reloc table entry
+        std::vector<int32_t> reloc_addends(num_relocs);
+        // Copy the reloc table into the working buffer
+        std::copy_n(reloc_table, num_relocs, reloc_table_copy.begin());
+
+        // Lambda that finds a reloc from relocations given a type and offset, writing a reference to it to `out`
+        // Returns the index of the reloc in relocations if a reloc was found, -1 if not
+        auto find_reloc = [&](elf_mips_reloc_type type, uint32_t offset, int32_t& out){
+            int idx = 0;
+            for (auto& cur_reloc : relocations) {
+                elf_mips_reloc_type corresponding_reloc_type = typeMap.at(cur_reloc.type);
+                if (cur_reloc.offset == offset && corresponding_reloc_type == (elf_mips_reloc_type)type) {
+                    out = cur_reloc.addend;
+                    return idx;
+                }
+                ++idx;
+            }
+            return -1;
+        };
+
+        // Do an initial pass to get the full addend for each reloc
+        for (ELFIO::Elf_Xword reloc_idx = 0; reloc_idx < num_relocs; ++reloc_idx) {
+            ELFIO::Elf64_Addr offset;
+            ELFIO::Elf_Word symbol;
+            ELFIO::Elf_Word type;
+            ELFIO::Elf_Sxword fake_addend; // Addend isn't encoded in the reloc, so this value is useless
+            rela.get_entry(reloc_idx, offset, symbol, type, fake_addend);
+
+            // We need to correlate Relocation objects to elf reloc table entries in order to get full addends, since they're not in the same order
+            int found_idx = find_reloc((elf_mips_reloc_type)type, (uint32_t)offset, reloc_addends[reloc_idx]);
+        }
+
+        // Check every entry to see if it's a stray HI16
+        for (ELFIO::Elf_Xword reloc_idx = 0; reloc_idx < num_relocs; ++reloc_idx) {
+            ELFIO::Elf64_Addr offset;
+            ELFIO::Elf_Word symbol;
+            ELFIO::Elf_Word type;
+            ELFIO::Elf_Sxword fake_addend; // Addend isn't encoded in the reloc, so this value is useless
+            int32_t addend = reloc_addends[reloc_idx]; // This will instead contain the full 32 bit addend
+            rela.get_entry(reloc_idx, offset, symbol, type, fake_addend);
+
+            // Check if this is a HI16
+            if ((elf_mips_reloc_type)type == elf_mips_reloc_type::R_MIPS_HI16) {
+                bool stray_reloc;
+                if (reloc_idx + 1 >= num_relocs) {
+                    // Make sure that we don't overrun the reloc table
+                    stray_reloc = true;
+                } else {
+                    ELFIO::Elf_Xword checked_idx = reloc_idx + 1;
+                    ELFIO::Elf64_Addr checked_offset;
+                    ELFIO::Elf_Word checked_symbol;
+                    ELFIO::Elf_Word checked_type;
+                    ELFIO::Elf_Sxword checked_fake_addend;
+                    int32_t checked_addend;
+                    // Loop through relocs until we hit one that isn't identical to the current one or until we hit the end of the symbol table
+                    do {
+                        rela.get_entry(checked_idx, checked_offset, checked_symbol, checked_type, checked_fake_addend);
+                        checked_addend = reloc_addends[checked_idx];
+                        ++checked_idx;
+                    } while (
+                        checked_idx + 1 < num_relocs &&
+                        (elf_mips_reloc_type)checked_type == elf_mips_reloc_type::R_MIPS_HI16 &&
+                        symbol == checked_symbol &&
+                        addend == checked_addend);
+
+                    // Check if we ended up at a LO16 with the same symbol and full addend as the HI16
+                    // If so, then this HI16 (and any that we passed over) is paired correctly
+                    if ((elf_mips_reloc_type)checked_type == elf_mips_reloc_type::R_MIPS_LO16 && symbol == checked_symbol && addend == checked_addend) {
+                        stray_reloc = false;
+                        // We can skip straight to the next reloc, as we've also verified all of the ones up the LO16 we found
+                        reloc_idx = checked_idx + 1;
+                    } else {
+                        stray_reloc = true;
+                    }
+                }
+                if (stray_reloc) {
+                    // Find the matching LO16
+                    ELFIO::Elf_Xword checked_idx;
+                    ELFIO::Elf64_Addr checked_offset;
+                    ELFIO::Elf_Word checked_symbol;
+                    ELFIO::Elf_Word checked_type;
+                    ELFIO::Elf_Sxword checked_fake_addend;
+                    int32_t checked_addend;
+                    
+                    ELFIO::Elf_Xword matching_idx = -1;
+
+                    // Loop through relocs until we find a LO16 with a matching offset, symbol, and addend
+                    for (checked_idx = 0; checked_idx < num_relocs; ++checked_idx) {
+                        rela.get_entry(checked_idx, checked_offset, checked_symbol, checked_type, checked_fake_addend);
+                        checked_addend = reloc_addends[checked_idx];
+                        // Check if this is a LO16 that matches
+                        if (checked_symbol == symbol &&
+                            checked_addend == addend &&
+                            (elf_mips_reloc_type)checked_type == elf_mips_reloc_type::R_MIPS_LO16) {
+                            matching_idx = checked_idx;
+                            break;
+                        }
+                    }
+
+                    if (matching_idx != -1) {
+                        if (matching_idx < reloc_idx) {
+                            // Move the HI16 backwards so it's before the LO16
+                            // This is effectively rotating the subset of the reloc table to the right
+                            //   so that the HI16 ends up at the start of the rotated output
+                            std::rotate(
+                                std::make_reverse_iterator(reloc_table_copy.begin() + reloc_idx + 1),
+                                std::make_reverse_iterator(reloc_table_copy.begin() + reloc_idx),
+                                std::make_reverse_iterator(reloc_table_copy.begin() + matching_idx));
+                            std::rotate(
+                                std::make_reverse_iterator(reloc_addends.begin() + reloc_idx + 1),
+                                std::make_reverse_iterator(reloc_addends.begin() + reloc_idx),
+                                std::make_reverse_iterator(reloc_addends.begin() + matching_idx));
+                        } else {
+                            // Shift the HI16 forwards so it's before the LO16
+                            // This is effectively rotating the subset of the reloc table to the left
+                            //   so that the HI16 ends up at the start of the rotated output
+                            std::rotate(
+                                reloc_table_copy.begin() + reloc_idx,
+                                reloc_table_copy.begin() + reloc_idx + 1,
+                                reloc_table_copy.begin() + matching_idx);
+                            std::rotate(
+                                reloc_addends.begin() + reloc_idx,
+                                reloc_addends.begin() + reloc_idx + 1,
+                                reloc_addends.begin() + matching_idx);
+                            // We've moved the table backwards, so we need to recheck this index
+                            // Decrement the index so that the loop increment is cancelled out
+                            reloc_idx--;
+                        }
+        
+                        // Update the reloc table so that get_entry is valid for the next iteration
+                        rel_sec->set_data((char*)reloc_table_copy.data(), num_relocs * sizeof(reloc_t));
+                    }
+                }
+            }
+        }
+    }
     return true;
 }
 
@@ -960,17 +1161,7 @@ bool PsyqLnkFile::Relocation::generateElf(ElfRelocationPass pass, const std::str
         }
         bool skipped = false;
     } skipped;
-    static const std::map<PsyqRelocType, elf_mips_reloc_type> typeMap = {
-        {PsyqRelocType::REL32, elf_mips_reloc_type::R_MIPS_32},
-        {PsyqRelocType::REL26, elf_mips_reloc_type::R_MIPS_26},
-        {PsyqRelocType::HI16, elf_mips_reloc_type::R_MIPS_HI16},
-        {PsyqRelocType::LO16, elf_mips_reloc_type::R_MIPS_LO16},
-        {PsyqRelocType::GPREL16, elf_mips_reloc_type::R_MIPS_GPREL16},
-        {PsyqRelocType::REL26_BE, elf_mips_reloc_type::R_MIPS_26},
-        {PsyqRelocType::HI16_BE, elf_mips_reloc_type::R_MIPS_HI16},
-        {PsyqRelocType::LO16_BE, elf_mips_reloc_type::R_MIPS_LO16},
-    };
-    auto simpleSymbolReloc = [&, this](Expression* expr, ELFIO::Elf_Word elfSym = 0, uint16_t symbolOffset = 0) {
+    auto simpleSymbolReloc = [&, this](Expression* expr, ELFIO::Elf_Word elfSym = 0, int32_t symbolOffset = 0) {
         if (psyq->twoPartsReloc) {
             psyq->setElfConversionError("Two-part relocation missing its second part");
             return false;
@@ -983,7 +1174,12 @@ bool PsyqLnkFile::Relocation::generateElf(ElfRelocationPass pass, const std::str
             }
             elfSym = symbol->elfSym;
         }
+        if (type == PsyqRelocType::HI16_BE || type == PsyqRelocType::LO16_BE) {
+            offset -= 0x2;
+        }
         auto elfType = typeMap.find(type);
+        // TODO get_entries_num to get the new entry index and insert the symbolOffset into a vector for referencing later
+        // to be used for reloc pairing
         rela.add_entry(offset, elfSym, (unsigned char)elfType->second);
         ELFIO::Elf_Xword size = section->section->get_size();
         uint8_t* sectionData = (uint8_t*)malloc(size);
@@ -1011,16 +1207,35 @@ bool PsyqLnkFile::Relocation::generateElf(ElfRelocationPass pass, const std::str
                 break;
             }
             case PsyqRelocType::REL26_BE: {
-                sectionData[offset + 3] = 0;
-                sectionData[offset + 2] = 0;
-                sectionData[offset + 1] = 0;
+                sectionData[offset + 3] = (uint8_t)(symbolOffset >> 0x02);
+                sectionData[offset + 2] = (uint8_t)(symbolOffset >> 0x0A);
+                sectionData[offset + 1] = (uint8_t)(symbolOffset >> 0x12);
                 sectionData[offset + 0] &= 0xfc;
+                sectionData[offset + 0] |= (uint8_t)(symbolOffset >> 0x1A);
                 break;
             }
-            case PsyqRelocType::HI16_BE:
+            case PsyqRelocType::HI16_BE: {
+                // Calculate the high reloc, accounting for the signedness of the corresponding low reloc
+                uint16_t hi = symbolOffset >> 16;
+                if (symbolOffset & 0x8000) {
+                    hi += 1;
+                }
+                sectionData[offset + 3] = (uint8_t)(hi >> 0);
+                sectionData[offset + 2] = (uint8_t)(hi >> 8);
+                break;
+            }
             case PsyqRelocType::LO16_BE: {
-                sectionData[offset + 1] = 0;
-                sectionData[offset + 0] = 0;
+                // Calculate the low reloc
+                uint16_t lo = symbolOffset & 0xFFFF;
+                sectionData[offset + 3] = (uint8_t)(lo >> 0);
+                sectionData[offset + 2] = (uint8_t)(lo >> 8);
+                break;
+            }
+            case PsyqRelocType::REL32_BE: {
+                sectionData[offset + 3] = (uint8_t)(symbolOffset >> 0x00);
+                sectionData[offset + 2] = (uint8_t)(symbolOffset >> 0x08);
+                sectionData[offset + 1] = (uint8_t)(symbolOffset >> 0x10);
+                sectionData[offset + 0] = (uint8_t)(symbolOffset >> 0x18);
                 break;
             }
             default:
@@ -1041,12 +1256,12 @@ bool PsyqLnkFile::Relocation::generateElf(ElfRelocationPass pass, const std::str
             psyq->setElfConversionError("Section {} not found in relocation", sectionIndex);
             return false;
         }
-        std::string symbolName = fmt::format("${}.rel{}@{:08x}", prefix, section->name, symbolOffset);
+        bool useLocalSymOffsets = true;
+        std::string symbolName = useLocalSymOffsets ? section->name : fmt::format("${}.rel{}@{:08x}", prefix, section->name, symbolOffset);
         auto existing = psyq->localElfSymbols.find(symbolName);
         ELFIO::Elf_Word elfSym;
         if (existing == psyq->localElfSymbols.end()) {
-            fmt::print("      :: Creating local symbol {}\n", symbolName);
-            elfSym = syma.add_symbol(stra, symbolName.c_str(), symbolOffset, 0, STB_LOCAL, STT_SECTION, 0,
+            elfSym = syma.add_symbol(stra, symbolName.c_str(), useLocalSymOffsets ? 0 : symbolOffset, 0, STB_LOCAL, STT_SECTION, 0,
                                      section->section->get_index());
             psyq->localElfSymbols.insert(std::make_pair(symbolName, elfSym));
         } else {
@@ -1055,6 +1270,7 @@ bool PsyqLnkFile::Relocation::generateElf(ElfRelocationPass pass, const std::str
         return simpleSymbolReloc(nullptr, elfSym, symbolOffset);
     };
     auto checkZero = [&, this](Expression* expr) {
+        this->addend = 0;
         switch (expr->type) {
             case PsyqExprOpcode::SECTION_BASE: {
                 return localSymbolReloc(expr->sectionIndex, 0);
@@ -1073,6 +1289,7 @@ bool PsyqLnkFile::Relocation::generateElf(ElfRelocationPass pass, const std::str
         }
     };
     auto check = [&, this](Expression* expr, int32_t addend) {
+        this->addend = addend;
         switch (expr->type) {
             case PsyqExprOpcode::SECTION_BASE: {
                 return localSymbolReloc(expr->sectionIndex, addend);
@@ -1140,6 +1357,13 @@ bool PsyqLnkFile::Relocation::generateElf(ElfRelocationPass pass, const std::str
                         addend >>= 8;
                         section->section->set_data((char*)sectionData, size);
                         free(sectionData);
+                        return true;
+                    }
+                    // Handled already
+                    case PsyqRelocType::REL32_BE:
+                    case PsyqRelocType::HI16_BE:
+                    case PsyqRelocType::LO16_BE: {
+                        bool success = simpleSymbolReloc(nullptr, elfSym, addend);
                         return true;
                     }
                     default: {
