@@ -154,9 +154,9 @@ void DynaRecCPU::emitBlockLookup() {
     const auto lutOffset = (size_t)m_recompilerLUT - (size_t)this;
 
     gen.mov(ecx, dword[contextPointer + PC_OFFSET]);  // ecx = pc
-    gen.mov(edx, ecx);      // edx = pc
-    gen.shr(ecx, 16);       // ecx = pc >> 16
-    gen.and_(edx, 0xfffc);  // edx = index into the recompiler LUT page, multiplied by 4
+    gen.mov(edx, ecx);                                // edx = pc
+    gen.shr(ecx, 16);                                 // ecx = pc >> 16
+    gen.and_(edx, 0xfffc);                            // edx = index into the recompiler LUT page, multiplied by 4
 
     // Load base pointer to recompiler LUT page in rax
     // Using a single mov if possible
@@ -191,7 +191,7 @@ void DynaRecCPU::emitDispatcher() {
         gen.sub(rsp, 32);
     }
 
-    emitBlockLookup(); // Look up block
+    emitBlockLookup();  // Look up block
 
     // Code to be executed after each block
     // Blocks will jmp to here
@@ -395,7 +395,7 @@ void DynaRecCPU::handleLinking() {
             }
 
             const auto pointer = gen.getCurr<uint8_t*>();
-            gen.jne((void*)m_returnFromBlock);    // Return if the block addr changed
+            gen.jne((void*)m_returnFromBlock);           // Return if the block addr changed
             recompile(nextBlockPointer, nextPC, false);  // Fallthrough to next block
 
             *(uint32_t*)(pointer - 4) = (uint32_t)(uintptr_t)*nextBlockPointer;  // Patch comparison value

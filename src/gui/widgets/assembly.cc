@@ -412,9 +412,9 @@ void PCSX::Widgets::Assembly::draw(GUI* gui, psxRegisters* registers, Memory* me
             if (ImGui::MenuItem(_("Resume"), "F5", nullptr, !g_system->running())) g_system->resume();
             ImGui::Separator();
             if (ImGui::MenuItem(_("Step In"), "F11", nullptr, !g_system->running())) g_emulator->m_debug->stepIn();
-            if (ImGui::MenuItem(_("Step Over"), "F10", nullptr, !g_system->running()))
-                g_emulator->m_debug->stepOver();
-            if (ImGui::MenuItem(_("Step Out"), "Shift+F11", nullptr, !g_system->running())) g_emulator->m_debug->stepOut();
+            if (ImGui::MenuItem(_("Step Over"), "F10", nullptr, !g_system->running())) g_emulator->m_debug->stepOver();
+            if (ImGui::MenuItem(_("Step Out"), "Shift+F11", nullptr, !g_system->running()))
+                g_emulator->m_debug->stepOut();
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu(_("Options"))) {

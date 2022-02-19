@@ -30,7 +30,7 @@ namespace PCSX {
 namespace Widgets {
 
 class MemoryObserver {
-public:
+  public:
     void draw(const char* title);
     bool m_show = false;
 
@@ -45,19 +45,16 @@ public:
         UnknownInitialValue
     };
 
-    enum class ScanAlignment : uint8_t {
-        OneByte = 1,
-        TwoBytes = 2,
-        FourBytes = 4
-    };
+    enum class ScanAlignment : uint8_t { OneByte = 1, TwoBytes = 2, FourBytes = 4 };
 
     struct AddressValuePair {
         uint32_t address = 0;
         int scannedValue = 0;
     };
 
-private:
-    static int getMemValue(uint32_t absoluteAddress, const uint8_t* memData, uint32_t memSize, uint32_t memBase, uint8_t stride);
+  private:
+    static int getMemValue(uint32_t absoluteAddress, const uint8_t* memData, uint32_t memSize, uint32_t memBase,
+                           uint8_t stride);
 
     ScanType m_scanType = ScanType::ExactValue;
     ScanAlignment m_scanAlignment = ScanAlignment::OneByte;
@@ -66,6 +63,6 @@ private:
     int m_value = 0;
 };
 
-}
+}  // namespace Widgets
 
-}
+}  // namespace PCSX

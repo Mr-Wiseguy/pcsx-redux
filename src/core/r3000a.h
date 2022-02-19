@@ -31,7 +31,6 @@
 #include "support/file.h"
 #include "support/hashtable.h"
 
-
 #if defined(__i386__) || defined(_M_IX86)
 #define DYNAREC_X86_32
 #elif defined(__x86_64) || defined(_M_AMD64)
