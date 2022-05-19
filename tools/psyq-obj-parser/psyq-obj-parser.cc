@@ -1133,9 +1133,6 @@ bool PsyqLnkFile::Section::generateElfRelocations(ElfRelocationPass pass, const 
                                 reloc_addends.begin() + reloc_idx,
                                 reloc_addends.begin() + reloc_idx + 1,
                                 reloc_addends.begin() + matching_idx);
-                            // We've moved the table backwards, so we need to recheck this index
-                            // Decrement the index so that the loop increment is cancelled out
-                            reloc_idx--;
                         }
         
                         // Update the reloc table so that get_entry is valid for the next iteration
